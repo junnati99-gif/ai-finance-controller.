@@ -2,22 +2,15 @@ import csv
 import json
 import os
 import sqlite3
-from typing import Literal
-from pydantic import BaseModel
+import streamlit as st
 from google import genai
-
-class ReconciliationResult(BaseModel):
-    invoice_id: str
-    status: Literal["MATCH", "REFUND_DUE", "REQUIRES_HUMAN_REVIEW"]
-    refund_amount: float
-    reason: str
-    sla_rule_cited: Literal["NONE", "OVERBILLING", "DOWNTIME_10_TO_30", "DOWNTIME_OVER_30", "DATA_CORRUPTION"]
 
 def init_db():
     conn = sqlite3.connect("audit_trail.db")
     cursor = conn.cursor()
+    cursor.execute("DROP TABLE IF EXISTS audit_logs")
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS audit_logs (
+        CREATE TABLE audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             invoice_id TEXT,
@@ -42,48 +35,69 @@ def run_reconciliation():
         for row in csv.DictReader(f):
             logs[row["invoice_id"]] = row
 
+    # Retrieve API key from Streamlit Secrets or Environment
     api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return "Error: GEMINI_API_KEY environment variable not set."
-
-    client = genai.Client(api_key=api_key)
-    
-    with open("sla_contracts.txt", "r") as f:
-        sla_text = f.read()
-
-    system_instruction = f"You are an automated AI Finance Controller. Rules:\n{sla_text}"
+    if not api_key and "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
 
     conn = sqlite3.connect("audit_trail.db")
     cursor = conn.cursor()
 
-    for for inv_id, inv in list(invoices.items())[:5]:
+    for inv_id, inv in invoices.items():
         log = logs.get(inv_id, {})
-        prompt_data = f"INVOICE: {json.dumps(inv)}\nLOG: {json.dumps(log)}"
         
-        try:
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=prompt_data,
-                config={
-                    "system_instruction": system_instruction,
-                    "response_mime_type": "application/json",
-                    "response_schema": ReconciliationResult,
-                    "temperature": 0.0,
-                }
-            )
-            res = ReconciliationResult.model_validate_json(response.text)
+        billed_units = float(inv.get("billed_units", 0))
+        unit_price = float(inv.get("unit_price", 0))
+        total_billed = float(inv.get("total_billed", 0))
+        
+        system_status = log.get("system_status", "OK")
+        
+        # Rule 3: Corrupted or missing log check
+        if system_status == "CORRUPTED_OR_MISSING" or not log.get("actual_units_used"):
             cursor.execute("""
                 INSERT INTO audit_logs (invoice_id, status, refund_amount, reason, sla_rule_cited)
                 VALUES (?, ?, ?, ?, ?)
-            """, (res.invoice_id, res.status, res.refund_amount, res.reason, res.sla_rule_cited))
-            
-        except Exception as e:
-            cursor.execute("""
-                INSERT INTO audit_logs (invoice_id, status, refund_amount, reason, sla_rule_cited)
-                VALUES (?, ?, ?, ?, ?)
-            """, (inv_id, "REQUIRES_HUMAN_REVIEW", 0.0, f"Guardrail: {str(e)}", "DATA_CORRUPTION"))
+            """, (inv_id, "REQUIRES_HUMAN_REVIEW", 0.0, "Usage log corrupted or missing in system records.", "DATA_CORRUPTION"))
+            continue
+
+        actual_units = float(log.get("actual_units_used", 0))
+        actual_downtime = float(log.get("actual_downtime_minutes", 0))
+
+        refund = 0.0
+        status = "MATCH"
+        sla_cited = "NONE"
+        reasons = []
+
+        # Rule 1: Overbilling Check
+        if billed_units > actual_units:
+            overbilled_units = billed_units - actual_units
+            overbilled_refund = round(overbilled_units * unit_price, 2)
+            refund += overbilled_refund
+            status = "REFUND_DUE"
+            sla_cited = "OVERBILLING"
+            reasons.append(f"Overbilled by {overbilled_units:.0f} units (${overbilled_refund:.2f} refund).")
+
+        # Rule 2: Downtime SLA Breach Check
+        if actual_downtime > 30:
+            downtime_refund = round(total_billed * 0.25, 2)
+            refund += downtime_refund
+            status = "REFUND_DUE"
+            sla_cited = "DOWNTIME_OVER_30"
+            reasons.append(f"Downtime was {actual_downtime:.0f} mins (>30m SLA breach: 25% refund = ${downtime_refund:.2f}).")
+        elif actual_downtime >= 10:
+            downtime_refund = round(total_billed * 0.10, 2)
+            refund += downtime_refund
+            status = "REFUND_DUE"
+            sla_cited = "DOWNTIME_10_TO_30"
+            reasons.append(f"Downtime was {actual_downtime:.0f} mins (10-30m SLA breach: 10% refund = ${downtime_refund:.2f}).")
+
+        reason_text = " ".join(reasons) if reasons else "Invoice matches system usage logs and SLA terms."
+
+        cursor.execute("""
+            INSERT INTO audit_logs (invoice_id, status, refund_amount, reason, sla_rule_cited)
+            VALUES (?, ?, ?, ?, ?)
+        """, (inv_id, status, round(refund, 2), reason_text, sla_cited))
 
     conn.commit()
     conn.close()
     return "Reconciliation Complete!"
-  
