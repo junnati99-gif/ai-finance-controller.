@@ -56,7 +56,7 @@ def run_reconciliation():
     conn = sqlite3.connect("audit_trail.db")
     cursor = conn.cursor()
 
-    for inv_id, inv in invoices.items():
+    for for inv_id, inv in list(invoices.items())[:5]:
         log = logs.get(inv_id, {})
         prompt_data = f"INVOICE: {json.dumps(inv)}\nLOG: {json.dumps(log)}"
         
